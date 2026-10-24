@@ -1,30 +1,90 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import { collection, doc, onSnapshot, getDocs, writeBatch } from "firebase/firestore";
+import { signInWithEmailAndPassword, onAuthStateChanged, signOut } from "firebase/auth";
+import { db, auth } from "./firebase";
 
 // ── STORAGE ───────────────────────────────────────────────────────────────────
 const STORAGE_KEY   = "peluqueria-clientes-v1";
 const STORAGE_CAJA  = "peluqueria-caja-v1";
 const STORAGE_VALES = "peluqueria-vales-v1";
-const cargarDatos   = () => { try { const r=localStorage.getItem(STORAGE_KEY);   if(r) return JSON.parse(r); } catch(_){} return null; };
-const guardarDatos  = (d) => { try { localStorage.setItem(STORAGE_KEY,   JSON.stringify(d)); } catch(_){} };
-const cargarCaja    = () => { try { const r=localStorage.getItem(STORAGE_CAJA);  if(r) return JSON.parse(r); } catch(_){} return []; };
-const guardarCaja   = (d) => { try { localStorage.setItem(STORAGE_CAJA,  JSON.stringify(d)); } catch(_){} };
-const cargarVales        = () => { try { const r=localStorage.getItem(STORAGE_VALES); if(r) return JSON.parse(r); } catch(_){} return []; };
-const guardarVales       = (d) => { try { localStorage.setItem(STORAGE_VALES, JSON.stringify(d)); } catch(_){} };
 const STORAGE_PROVEEDORES  = "fusion-proveedores-v1";
 const STORAGE_EFECTIVO_DIA = "fusion-efectivo-dia-v1";
 const STORAGE_ULTIMO_RESPALDO = "fusion-ultimo-respaldo";
 const CLAVES_RESPALDO = [STORAGE_KEY, STORAGE_CAJA, STORAGE_VALES, STORAGE_PROVEEDORES, STORAGE_EFECTIVO_DIA];
-const cargarProveedores  = () => { try { const r=localStorage.getItem(STORAGE_PROVEEDORES);  if(r) return JSON.parse(r); } catch(_){} return []; };
-const guardarProveedores = (d) => { try { localStorage.setItem(STORAGE_PROVEEDORES, JSON.stringify(d)); } catch(_){} };
-const cargarEfectivoDia  = () => { try { const r=localStorage.getItem(STORAGE_EFECTIVO_DIA); if(r) return JSON.parse(r); } catch(_){} return []; };
-const guardarEfectivoDia = (d) => { try { localStorage.setItem(STORAGE_EFECTIVO_DIA, JSON.stringify(d)); } catch(_){} };
+const STORAGE_MIGRADO = "fusion-migrado-nube";
+
+// ── NUBE (Firestore) ──────────────────────────────────────────────────────────
+// clave del respaldo -> colección en Firestore (un documento por registro)
+const COLECCIONES = {
+  [STORAGE_KEY]: "gestion_clientes",
+  [STORAGE_CAJA]: "gestion_caja",
+  [STORAGE_VALES]: "gestion_vales",
+  [STORAGE_PROVEEDORES]: "gestion_proveedores",
+  [STORAGE_EFECTIVO_DIA]: "gestion_efectivo",
+};
+const limpiar = (x) => JSON.parse(JSON.stringify(x)); // Firestore no acepta "undefined"
+
+async function subirRegistros(nombre, items) {
+  const lista = (Array.isArray(items) ? items : []).filter(x => x && x.id !== undefined && x.id !== null);
+  for (let i = 0; i < lista.length; i += 400) {
+    const batch = writeBatch(db);
+    lista.slice(i, i + 400).forEach(x => batch.set(doc(db, nombre, String(x.id)), limpiar(x)));
+    await batch.commit();
+  }
+  return lista.length;
+}
+async function leerColeccion(nombre) {
+  const snap = await getDocs(collection(db, nombre));
+  return snap.docs.map(d => d.data());
+}
+async function borrarColeccion(nombre) {
+  const snap = await getDocs(collection(db, nombre));
+  for (let i = 0; i < snap.docs.length; i += 400) {
+    const batch = writeBatch(db);
+    snap.docs.slice(i, i + 400).forEach(d => batch.delete(d.ref));
+    await batch.commit();
+  }
+}
+
+// Hook: devuelve [items, setItems]. setItems funciona igual que un setState (acepta función)
+// pero guarda en la nube solo los registros que cambiaron o se borraron.
+function useColeccion(nombre) {
+  const [items, setItems] = useState(null); // null = cargando
+  const ref = useRef([]);
+  useEffect(() => {
+    return onSnapshot(
+      collection(db, nombre),
+      (snap) => { const arr = snap.docs.map(d => d.data()); ref.current = arr; setItems(arr); },
+      (err) => { console.error(err); alert("No se pudieron leer los datos (" + nombre + "): " + err.message); setItems([]); }
+    );
+  }, [nombre]);
+  const guardar = useCallback((upd) => {
+    const prev = ref.current;
+    const next = typeof upd === "function" ? upd(prev) : upd;
+    ref.current = next;
+    setItems(next);
+    const prevMap = new Map(prev.map(x => [String(x.id), x]));
+    const nextIds = new Set(next.map(x => String(x.id)));
+    const batch = writeBatch(db);
+    let ops = 0;
+    next.forEach(x => {
+      const k = String(x.id);
+      const nuevo = limpiar(x);
+      const old = prevMap.get(k);
+      if (!old || JSON.stringify(limpiar(old)) !== JSON.stringify(nuevo)) { batch.set(doc(db, nombre, k), nuevo); ops++; }
+    });
+    prev.forEach(x => { if (!nextIds.has(String(x.id))) { batch.delete(doc(db, nombre, String(x.id))); ops++; } });
+    if (ops > 0) batch.commit().catch(err => { console.error(err); alert("No se pudo guardar en la nube: " + err.message); });
+  }, [nombre]);
+  return [items, guardar];
+}
 
 // ── CATÁLOGO ──────────────────────────────────────────────────────────────────
 const SERVICIOS_CATALOGO = [
   {id:1,nombre:"Corte"},{id:2,nombre:"Brushing / Planchita"},{id:3,nombre:"Color / Tintura"},
   {id:4,nombre:"Keratina / Botox"},{id:5,nombre:"Alisado"},{id:6,nombre:"Manicuria"},
   {id:7,nombre:"Belleza de pies"},{id:8,nombre:"Decoloración / Mechas"},{id:9,nombre:"Lavado"},
-  {id:10,nombre:"Baño de crema"},{id:11,nombre:"Ampollas"}, {id:12,nombre:"Baño de luz"}, {id:13,nombre:"Depilación"},
+  {id:10,nombre:"Baño de crema"},{id:11,nombre:"Ampollas"},
 ];
 const PROFESIONALES = ["Mirta Fernández","Rossana Fernández","Ariela Fernández","Celeste Córdoba","Cristian Coronel"];
 const MESES       = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
@@ -32,6 +92,7 @@ const DIAS_SEMANA = ["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
 
 // ── UTILS ─────────────────────────────────────────────────────────────────────
 const fmt       = (n) => `$${Number(n).toLocaleString("es-AR")}`;
+const fmtSaldo  = (n) => `${n<0?"-":"+"}${fmt(Math.abs(n))}`;
 const fmtFecha  = (s) => { if(!s) return "—"; const [y,m,d]=s.split("-"); return `${d}/${m}/${y}`; };
 const hoyStr    = ()  => new Date().toISOString().split("T")[0];
 const deudaCliente  = (c) => c.visitas.reduce((a,v)=>a+(v.total-v.pagado),0);
@@ -544,14 +605,14 @@ function ModalMovimiento({onClose,onSave,movimiento}) {
 
 // ── VISTA CAJA ────────────────────────────────────────────────────────────────
 function VistaCaja({clientes}) {
-  const [movs,setMovsRaw]=useState(()=>cargarCaja());
+  const [movsNube,setMovs]=useColeccion("gestion_caja");
+  const movs=useMemo(()=>movsNube||[],[movsNube]);
   const [modal,setModal]=useState(false);
   const [movEditando,setMovEditando]=useState(null);
   const [paginaCaja,setPaginaCaja]=useState(1);
   const POR_PAG_CAJA=10;
   const [desde,setDesde]=useState(()=>{const d=new Date();d.setDate(1);return d.toISOString().split("T")[0];});
   const [hasta,setHasta]=useState(hoyStr());
-  const setMovs=(upd)=>setMovsRaw(p=>{const n=typeof upd==="function"?upd(p):upd;guardarCaja(n);return n;});
   const ingAuto=useMemo(()=>{
     const r=[];
     clientes.forEach(c=>c.visitas.forEach(v=>{
@@ -636,22 +697,14 @@ function VistaCaja({clientes}) {
 
 // ── SECCIÓN EFECTIVO DEL DÍA ──────────────────────────────────────────────────
 function SeccionEfectivoDia() {
-  const [registros,setRegistrosRaw] = useState(()=>{
-    const data = cargarEfectivoDia();
-    // Limpiar registros corruptos (sin monto válido)
-    return Array.isArray(data) ? data.filter(r=>r&&typeof r.monto==="number"&&!isNaN(r.monto)) : [];
-  });
+  const [registrosNube,setRegistros] = useColeccion("gestion_efectivo");
+  const registros = useMemo(()=>(registrosNube||[]).filter(r=>r&&typeof r.monto==="number"&&!isNaN(r.monto)),[registrosNube]);
   const [fecha,setFecha]     = useState(hoyStr());
   const [monto,setMonto]     = useState("");
   const [nota,setNota]       = useState("");
   const [editando,setEditando] = useState(null); // id del registro editando
   const [expanded,setExpanded] = useState(true);
 
-  const setRegistros = (upd) => setRegistrosRaw(p=>{
-    const n = typeof upd==="function" ? upd(p) : upd;
-    guardarEfectivoDia(n);
-    return n;
-  });
 
   const limpiarForm = () => { setMonto(""); setNota(""); setFecha(hoyStr()); setEditando(null); };
 
@@ -684,12 +737,12 @@ function SeccionEfectivoDia() {
     const map = {};
     registros.forEach(r=>{
       if(!r||!r.fecha) return;
-      if(!map[r.fecha]) map[r.fecha] = {fecha:r.fecha, total:0, registros:[]};  
-      map[r.fecha].total += Number(r.monto)||0; 
-      map[r.fecha].registros.push(r); 
-    }); 
+      if(!map[r.fecha]) map[r.fecha] = {fecha:r.fecha, total:0, registros:[]};
+      map[r.fecha].total += Number(r.monto)||0;
+      map[r.fecha].registros.push(r);
+    });
     return Object.values(map).sort((a,b)=>b.fecha.localeCompare(a.fecha));
-  },[registros]);   
+  },[registros]);
 
   return (
     <div className="rounded-xl overflow-hidden mt-2" style={{border:"1px solid rgba(212,175,55,0.2)"}}>
@@ -868,14 +921,14 @@ function VistaCalendario({clientes}) {
 function VistaProfesionales() {
   const hoy=new Date();
   const mesActual=`${hoy.getFullYear()}-${String(hoy.getMonth()+1).padStart(2,"0")}`;
-  const [vales,setValesRaw]=useState(()=>cargarVales());
+  const [valesNube,setVales]=useColeccion("gestion_vales");
+  const vales=useMemo(()=>valesNube||[],[valesNube]);
   const [modal,setModal]=useState(false);
   const [profSel,setProfSel]=useState(PROFESIONALES[0]);
   const [filtroProf,setFiltroProf]=useState("todos");
   const [filtroMesVales,setFiltroMesVales]=useState(mesActual);
   const [paginaVales,setPaginaVales]=useState(1);
   const POR_PAG_VALES=10;
-  const setVales=(upd)=>setValesRaw(p=>{const n=typeof upd==="function"?upd(p):upd;guardarVales(n);return n;});
 
   const mesesVales=useMemo(()=>{
     const set=new Set(vales.map(v=>v.fecha.slice(0,7)));
@@ -1063,6 +1116,8 @@ function ModalRestaurar({onClose,onConfirm}) {
                 <li>• Todos los clientes y su historial de visitas</li>
                 <li>• Todos los movimientos de caja</li>
                 <li>• Todos los vales de profesionales</li>
+                <li>• Proveedores y efectivo guardado</li>
+                <li className="text-red-400">• Los datos están en la nube: se borran para TODAS las compañeras</li>
               </ul>
               <p className="text-xs text-zinc-600">Esta acción no se puede deshacer.</p>
             </>
@@ -1105,14 +1160,14 @@ function ConfirmInput({onConfirm,onCancel}) {
 
 // ── VISTA PROVEEDORES ─────────────────────────────────────────────────────────
 function VistaProveedores() {
-  const [proveedores,setProvsRaw] = useState(()=>cargarProveedores());
+  const [proveedoresNube,setProvs] = useColeccion("gestion_proveedores");
+  const proveedores = useMemo(()=>proveedoresNube||[],[proveedoresNube]);
   const [provSel,setProvSel]      = useState(null);
   const [modalProv,setModalProv]  = useState(false);   // nuevo proveedor
   const [modalMov,setModalMov]    = useState(false);    // nuevo movimiento
   const [paginaMov,setPaginaMov]  = useState(1);
   const POR_PAG_MOV = 10;
 
-  const setProvs = (upd) => setProvsRaw(p=>{const n=typeof upd==="function"?upd(p):upd;guardarProveedores(n);return n;});
 
   const provActual = provSel ? proveedores.find(p=>p.id===provSel) : null;
 
@@ -1183,7 +1238,7 @@ function VistaProveedores() {
                       <p className="text-xs text-zinc-500">Debe: <span className="text-red-400 font-medium">{fmt(totalDebe)}</span></p>
                       <p className="text-xs text-zinc-500">Haber: <span className="text-emerald-400 font-medium">{fmt(totalHaber)}</span></p>
                       <p className={`text-sm font-bold mt-0.5 ${sal>=0?"text-emerald-400":"text-red-400"}`}>
-                        Saldo: {sal>=0?"+":""}{fmt(sal)}
+                        Saldo: {fmtSaldo(sal)}
                       </p>
                     </div>
                   </div>
@@ -1240,7 +1295,7 @@ function VistaProveedores() {
         {[
           {label:"Total Debe",value:fmt(totalDebe),color:"#f87171",icon:"📤"},
           {label:"Total Haber",value:fmt(totalHaber),color:"#34d399",icon:"📥"},
-          {label:"Saldo actual",value:(salActual>=0?"+":"")+fmt(salActual),color:salActual>=0?"#34d399":"#f87171",icon:"⚖️"},
+          {label:"Saldo actual",value:fmtSaldo(salActual),color:salActual>=0?"#34d399":"#f87171",icon:"⚖️"},
         ].map(s=>(
           <div key={s.label} className="rounded-xl p-3 text-center"
             style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)"}}>
@@ -1266,41 +1321,34 @@ function VistaProveedores() {
         {provActual.movimientos.length===0
           ? <p className="text-sm text-zinc-600 text-center py-8">Sin movimientos registrados</p>
           : <>
-            <div className="rounded-xl overflow-hidden" style={{border:"1px solid rgba(255,255,255,0.07)"}}>
-              {/* Encabezado tabla */}
-              <div className="grid grid-cols-12 px-3 py-2 text-xs text-zinc-600 font-medium uppercase tracking-wider"
-                style={{background:"rgba(255,255,255,0.03)",borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
-                <span className="col-span-2">Fecha</span>
-                <span className="col-span-4">Detalle</span>
-                <span className="col-span-1 text-right">Método</span>
-                <span className="col-span-2 text-right text-red-400">Debe</span>
-                <span className="col-span-2 text-right text-emerald-400">Haber</span>
-                <span className="col-span-1 text-right">Saldo</span>
-              </div>
-              {/* Filas */}
+            <div className="space-y-2">
               {movsConSaldoPag.map(m=>(
-                <div key={m.id} className="grid grid-cols-12 px-3 py-2.5 items-center text-xs"
-                  style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
-                  <span className="col-span-2 text-zinc-400">{fmtFecha(m.fecha)}</span>
-                  <div className="col-span-4">
-                    <p className="text-white font-medium">{m.detalle}</p>
-                    {m.nota&&<p className="text-zinc-600 italic text-xs">{m.nota}</p>}
+                <div key={m.id} className="rounded-xl p-3" style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)"}}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-white break-words">{m.detalle}</p>
+                      <div className="flex items-center gap-2 mt-1 flex-wrap">
+                        <span className="text-xs text-zinc-500">{fmtFecha(m.fecha)}</span>
+                        {m.metodoPago&&<MetodoBadge metodo={m.metodoPago}/>}
+                      </div>
+                      {m.nota&&<p className="text-xs text-zinc-600 italic mt-1">{m.nota}</p>}
+                    </div>
+                    <button onClick={()=>eliminarMovimiento(m.id)} className="text-xs px-2 py-1 rounded-lg shrink-0"
+                      style={{background:"rgba(239,68,68,0.15)",color:"#f87171",border:"1px solid rgba(239,68,68,0.3)"}}>🗑️</button>
                   </div>
-                  <span className="col-span-1 text-right">
-                    {m.metodoPago&&<MetodoBadge metodo={m.metodoPago}/>}
-                  </span>
-                  <span className="col-span-2 text-right font-medium text-red-400">
-                    {m.debe>0?fmt(m.debe):"—"}
-                  </span>
-                  <span className="col-span-2 text-right font-medium text-emerald-400">
-                    {m.haber>0?fmt(m.haber):"—"}
-                  </span>
-                  <div className="col-span-1 text-right flex items-center justify-end gap-1">
-                    <span className={`font-bold ${m.saldoAcum>=0?"text-emerald-400":"text-red-400"}`}>
-                      {m.saldoAcum>=0?"+":""}{fmt(m.saldoAcum)}
-                    </span>
-                    <button onClick={()=>eliminarMovimiento(m.id)}
-                      className="text-zinc-700 hover:text-red-400 text-sm leading-none ml-1">×</button>
+                  <div className="grid grid-cols-3 gap-2 mt-3 text-center">
+                    <div className="rounded-lg py-1.5 px-1" style={{background:"rgba(239,68,68,0.08)"}}>
+                      <p className="text-[10px] uppercase tracking-wider text-zinc-500">Debe</p>
+                      <p className="text-sm font-bold text-red-400">{m.debe>0?fmt(m.debe):"—"}</p>
+                    </div>
+                    <div className="rounded-lg py-1.5 px-1" style={{background:"rgba(52,211,153,0.08)"}}>
+                      <p className="text-[10px] uppercase tracking-wider text-zinc-500">Haber</p>
+                      <p className="text-sm font-bold text-emerald-400">{m.haber>0?fmt(m.haber):"—"}</p>
+                    </div>
+                    <div className="rounded-lg py-1.5 px-1" style={{background:"rgba(255,255,255,0.04)"}}>
+                      <p className="text-[10px] uppercase tracking-wider text-zinc-500">Saldo</p>
+                      <p className={`text-sm font-bold ${m.saldoAcum>=0?"text-emerald-400":"text-red-400"}`}>{fmtSaldo(m.saldoAcum)}</p>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -1442,8 +1490,9 @@ function ModalMovimientoProveedor({onClose,onSave}) {
 }
 
 // ── APP PRINCIPAL ─────────────────────────────────────────────────────────────
-export default function App() {
-  const [clientes,setClientesRaw]=useState(()=>cargarDatos()||[]);
+function AppGestion({usuario}) {
+  const [clientesNube,setClientes]=useColeccion("gestion_clientes");
+  const clientes=useMemo(()=>clientesNube||[],[clientesNube]);
   const [busqueda,setBusqueda]=useState("");
   const [filtro,setFiltro]=useState("todos");
   const [filtroMes,setFiltroMes]=useState("");  // "" = todos, "YYYY-MM" = mes especifico
@@ -1454,7 +1503,6 @@ export default function App() {
   const [pestana,setPestana]=useState("clientes");
   const [modalReset,setModalReset]=useState(false);
 
-  const setClientes=(upd)=>setClientesRaw(p=>{const n=typeof upd==="function"?upd(p):upd;guardarDatos(n);return n;});
   const resetPagClientes=()=>setPaginaClientes(1);
 
   const filtrados=useMemo(()=>{
@@ -1494,12 +1542,7 @@ export default function App() {
   // ── RESPALDO: exportar / importar ──
   const [ultimoRespaldo,setUltimoRespaldo]=useState(()=>{try{return localStorage.getItem(STORAGE_ULTIMO_RESPALDO)||"";}catch(_){return "";}});
 
-  const exportarDatos=()=>{
-    const datos={};
-    CLAVES_RESPALDO.forEach(k=>{
-      try{const r=localStorage.getItem(k);datos[k]=r?JSON.parse(r):null;}catch(_){datos[k]=null;}
-    });
-    const paquete={app:"fusion-peluqueria",version:1,exportado:new Date().toISOString(),datos};
+  const descargarJSON=(paquete)=>{
     const blob=new Blob([JSON.stringify(paquete,null,2)],{type:"application/json"});
     const url=URL.createObjectURL(blob);
     const a=document.createElement("a");
@@ -1509,51 +1552,88 @@ export default function App() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    try{localStorage.setItem(STORAGE_ULTIMO_RESPALDO,hoyStr());}catch(_){}
-    setUltimoRespaldo(hoyStr());
   };
 
+  const exportarDatos=async()=>{
+    try{
+      const datos={};
+      for(const [clave,nombre] of Object.entries(COLECCIONES)) datos[clave]=await leerColeccion(nombre);
+      descargarJSON({app:"fusion-peluqueria",version:1,exportado:new Date().toISOString(),datos});
+      try{localStorage.setItem(STORAGE_ULTIMO_RESPALDO,hoyStr());}catch(_){}
+      setUltimoRespaldo(hoyStr());
+    }catch(err){
+      alert("No se pudo generar el respaldo: "+err.message);
+    }
+  };
+
+  // Importar = SUBIR a la nube los registros del archivo (no borra nada; si el id ya existe, se sobrescribe)
   const importarDatos=(e)=>{
     const archivo=e.target.files?.[0];
     e.target.value="";
     if(!archivo) return;
     const lector=new FileReader();
-    lector.onload=()=>{
+    lector.onload=async()=>{
       try{
         const paquete=JSON.parse(lector.result);
         if(paquete.app!=="fusion-peluqueria"||!paquete.datos) return alert("Este archivo no es un respaldo válido de la app.");
         const nClientes=Array.isArray(paquete.datos[STORAGE_KEY])?paquete.datos[STORAGE_KEY].length:0;
-        const ok=window.confirm(`Vas a reemplazar TODOS los datos actuales con el respaldo del ${paquete.exportado?.slice(0,10)||"—"}.\n\nEl respaldo tiene ${nClientes} clientes.\n\n¿Continuar?`);
+        const ok=window.confirm(`Vas a SUBIR a la nube el respaldo del ${paquete.exportado?.slice(0,10)||"—"} (${nClientes} clientes).\n\nNo se borra nada: los registros nuevos se agregan y los que ya existan se sobrescriben.\n\n¿Continuar?`);
         if(!ok) return;
-        CLAVES_RESPALDO.forEach(k=>{
-          const v=paquete.datos[k];
-          if(v!==null&&v!==undefined) localStorage.setItem(k,JSON.stringify(v));
-          else localStorage.removeItem(k);
-        });
-        window.location.reload();
-      }catch(_){
-        alert("No se pudo leer el archivo. Verificá que sea un respaldo descargado desde esta app.");
+        let total=0;
+        for(const [clave,nombre] of Object.entries(COLECCIONES)) total+=await subirRegistros(nombre,paquete.datos[clave]);
+        alert(`Listo: se subieron ${total} registros.`);
+      }catch(err){
+        alert("No se pudo importar el archivo: "+err.message);
       }
     };
     lector.readAsText(archivo);
   };
 
+  // Migración única: datos que quedaron en el navegador (versión anterior sin nube)
+  const [pendienteMigrar,setPendienteMigrar]=useState(()=>{
+    try{
+      if(localStorage.getItem(STORAGE_MIGRADO)) return false;
+      return CLAVES_RESPALDO.some(k=>{const r=localStorage.getItem(k);if(!r) return false;const v=JSON.parse(r);return Array.isArray(v)&&v.length>0;});
+    }catch(_){return false;}
+  });
+  const migrarLocalANube=async()=>{
+    if(!window.confirm("Vas a subir a la nube los datos guardados en ESTE navegador.\n\nHacelo una sola vez y solo desde el navegador donde tenés tus datos reales.\n\n¿Continuar?")) return;
+    try{
+      let total=0;
+      for(const [clave,nombre] of Object.entries(COLECCIONES)){
+        const r=localStorage.getItem(clave);
+        if(r) total+=await subirRegistros(nombre,JSON.parse(r));
+      }
+      localStorage.setItem(STORAGE_MIGRADO,hoyStr());
+      setPendienteMigrar(false);
+      alert(`Listo: se subieron ${total} registros a la nube.`);
+    }catch(err){
+      alert("No se pudo subir: "+err.message);
+    }
+  };
+
   const diasSinRespaldo=ultimoRespaldo?Math.floor((new Date(hoyStr())-new Date(ultimoRespaldo))/86400000):null;
   const respaldoViejo=diasSinRespaldo===null||diasSinRespaldo>=7;
 
-  const restaurarTodo=()=>{
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(STORAGE_CAJA);
-    localStorage.removeItem(STORAGE_VALES);
-    localStorage.removeItem(STORAGE_PROVEEDORES);
-    localStorage.removeItem(STORAGE_EFECTIVO_DIA);
-    setClientesRaw([]);
+  const restaurarTodo=async()=>{
+    try{
+      for(const nombre of Object.values(COLECCIONES)) await borrarColeccion(nombre);
+    }catch(err){
+      alert("No se pudo borrar: "+err.message);
+      return;
+    }
     setModalReset(false);
     setPestana("clientes");
     setClienteActivo(null);
   };
 
   const clienteActualizado=clienteActivo?clientes.find(c=>c.id===clienteActivo.id):null;
+
+  if(clientesNube===null) return (
+    <div className="min-h-screen flex items-center justify-center" style={{background:"#13131f"}}>
+      <p className="text-sm text-zinc-500">Cargando datos…</p>
+    </div>
+  );
 
   return (
     <div className="min-h-screen pb-24" style={{background:"#13131f",fontFamily:"'Segoe UI', sans-serif"}}>
@@ -1579,9 +1659,18 @@ export default function App() {
               <button onClick={()=>setModalReset(true)} className="text-xs px-3 py-1.5 rounded-lg transition-colors" style={{background:"rgba(239,68,68,0.1)",color:"#f87171",border:"1px solid rgba(239,68,68,0.2)"}}>
                 🔄 Restaurar
               </button>
+              <button onClick={()=>signOut(auth)} title={usuario?.email} className="text-xs px-3 py-1.5 rounded-lg transition-colors" style={{background:"rgba(255,255,255,0.05)",color:"#a1a1aa",border:"1px solid rgba(255,255,255,0.1)"}}>
+                Salir
+              </button>
             </div>
           )}
         </div>
+        {!clienteActualizado&&pendienteMigrar&&(
+          <div className="rounded-lg px-3 py-2 mb-4 text-xs flex items-center justify-between gap-3" style={{background:"rgba(52,211,153,0.1)",border:"1px solid rgba(52,211,153,0.3)",color:"#34d399"}}>
+            <span>☁️ Hay datos guardados en este navegador que todavía no están en la nube.</span>
+            <button onClick={migrarLocalANube} className="font-bold underline shrink-0">Subir a la nube</button>
+          </div>
+        )}
         {!clienteActualizado&&respaldoViejo&&(
           <div className="rounded-lg px-3 py-2 mb-4 text-xs flex items-center justify-between gap-3" style={{background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",color:"#fbbf24"}}>
             <span>⚠️ {ultimoRespaldo?`Hace ${diasSinRespaldo} días que no descargás un respaldo.`:"Todavía no descargaste ningún respaldo."}</span>
@@ -1728,4 +1817,66 @@ export default function App() {
       {modalReset&&<ModalRestaurar onClose={()=>setModalReset(false)} onConfirm={restaurarTodo}/>}
     </div>
   );
+}
+
+// ── LOGIN ─────────────────────────────────────────────────────────────────────
+function PantallaLogin() {
+  const [email,setEmail]=useState("");
+  const [pass,setPass]=useState("");
+  const [error,setError]=useState("");
+  const [cargando,setCargando]=useState(false);
+
+  const entrar=async()=>{
+    if(!email.trim()||!pass) return setError("Completá el email y la contraseña");
+    setCargando(true); setError("");
+    try{
+      await signInWithEmailAndPassword(auth,email.trim(),pass);
+    }catch(err){
+      const codigos=["auth/invalid-credential","auth/wrong-password","auth/user-not-found","auth/invalid-email"];
+      setError(codigos.includes(err.code)?"Email o contraseña incorrectos":"No se pudo ingresar: "+err.message);
+      setCargando(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4" style={{background:"#13131f",fontFamily:"'Segoe UI', sans-serif"}}>
+      <div className="w-full max-w-sm rounded-2xl p-6 space-y-4" style={{background:"#1a1a2e",border:"1px solid rgba(212,175,55,0.3)"}}>
+        <div className="text-center">
+          <div className="text-4xl mb-1">✂️</div>
+          <h1 className="text-xl font-bold" style={{color:"#d4af37"}}>Fusión</h1>
+          <p className="text-xs text-zinc-500 uppercase tracking-widest">Sistema de gestión</p>
+        </div>
+        <div>
+          <label className="text-xs text-amber-400/70 uppercase tracking-widest block mb-1.5">Email</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="username"
+            className="w-full px-3 py-2 rounded-lg text-sm text-white"
+            style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(212,175,55,0.25)"}}/>
+        </div>
+        <div>
+          <label className="text-xs text-amber-400/70 uppercase tracking-widest block mb-1.5">Contraseña</label>
+          <input type="password" value={pass} onChange={e=>setPass(e.target.value)} autoComplete="current-password"
+            onKeyDown={e=>e.key==="Enter"&&entrar()}
+            className="w-full px-3 py-2 rounded-lg text-sm text-white"
+            style={{background:"rgba(255,255,255,0.06)",border:"1px solid rgba(212,175,55,0.25)"}}/>
+        </div>
+        {error&&<p className="text-xs text-red-400">{error}</p>}
+        <button onClick={entrar} disabled={cargando} className="w-full py-2.5 rounded-xl text-sm font-bold disabled:opacity-50"
+          style={{background:"linear-gradient(135deg, #d4af37, #b8932a)",color:"#1a1a2e"}}>
+          {cargando?"Ingresando…":"Ingresar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [usuario,setUsuario]=useState(undefined); // undefined = verificando sesión
+  useEffect(()=>onAuthStateChanged(auth,u=>setUsuario(u||null)),[]);
+  if(usuario===undefined) return (
+    <div className="min-h-screen flex items-center justify-center" style={{background:"#13131f"}}>
+      <p className="text-sm text-zinc-500">Cargando…</p>
+    </div>
+  );
+  if(!usuario) return <PantallaLogin/>;
+  return <AppGestion usuario={usuario}/>;
 }
