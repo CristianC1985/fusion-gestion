@@ -84,7 +84,7 @@ const SERVICIOS_CATALOGO = [
   {id:1,nombre:"Corte"},{id:2,nombre:"Brushing / Planchita"},{id:3,nombre:"Color / Tintura"},
   {id:4,nombre:"Keratina / Botox"},{id:5,nombre:"Alisado"},{id:6,nombre:"Manicuria"},
   {id:7,nombre:"Belleza de pies"},{id:8,nombre:"Decoloración / Mechas"},{id:9,nombre:"Lavado"},
-  {id:10,nombre:"Baño de crema"},{id:11,nombre:"Ampollas"},{id:12,nombre:"Ampollas"},{id:13,nombre:"Venta de productos"},{id:14,nombre:"Otros"},
+  {id:10,nombre:"Baño de crema"},{id:11,nombre:"Ampollas"},{id:12,nombre:"Depilación"},{id:13,nombre:"Venta de productos"},{id:14,nombre:"Otros"},
 ];
 const PROFESIONALES = ["Mirta Fernández","Rossana Fernández","Ariela Fernández","Celeste Córdoba","Cristian Coronel"];
 const MESES       = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"];
